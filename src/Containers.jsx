@@ -13,6 +13,7 @@ import * as Select from '../lib/cockpit-components-select.jsx';
 import ContainerDeleteModal from './ContainerDeleteModal.jsx';
 import ContainerCheckpointModal from './ContainerCheckpointModal.jsx';
 import ContainerRestoreModal from './ContainerRestoreModal.jsx';
+import ContainerMigrateModal from "./ContainerMigrateModal.jsx";
 import ContainerRemoveErrorModal from './ContainerRemoveErrorModal.jsx';
 import * as utils from './util.js';
 import * as client from './client.js';
@@ -31,12 +32,17 @@ class Containers extends React.Component {
             selectContainerDeleteModal: false,
             selectContainerCheckpointModal: false,
             selectContainerRestoreModal: false,
+            setContainerMigrateModal: false,
             setContainerRemoveErrorModal: false,
             containerWillDelete: {},
             containerWillCheckpoint: {},
             containerWillRestore: {},
+            containerWillMigrate: {},
             checkpointInProgress: false,
             restoreInProgress: false,
+            migrateInProgress: false,
+            migrationStateLabel: "",
+            remoteHosts: {},
             width: 0,
             filter: "running",
         };
@@ -49,9 +55,11 @@ class Containers extends React.Component {
         this.handleCancelContainerDeleteModal = this.handleCancelContainerDeleteModal.bind(this);
         this.handleCheckpointContainerDeleteModal = this.handleCheckpointContainerDeleteModal.bind(this);
         this.handleRestoreContainerDeleteModal = this.handleRestoreContainerDeleteModal.bind(this);
+        this.handleMigrateContainerDeleteModal = this.handleMigrateContainerDeleteModal.bind(this);
         this.handleRemoveContainer = this.handleRemoveContainer.bind(this);
         this.handleCheckpointContainer = this.handleCheckpointContainer.bind(this);
         this.handleRestoreContainer = this.handleRestoreContainer.bind(this);
+        this.handleMigrateContainer = this.handleMigrateContainer.bind(this);
         this.handleCancelRemoveError = this.handleCancelRemoveError.bind(this);
         this.handleForceRemoveContainer = this.handleForceRemoveContainer.bind(this);
         this.handleFilterChange = this.handleFilterChange.bind(this);
@@ -89,6 +97,15 @@ class Containers extends React.Component {
         this.setState({
             containerWillCheckpoint: container,
             selectContainerCheckpointModal: true,
+        });
+    }
+
+    migrateContainer(container) {
+        this.state.remoteHosts = utils.getRemoteHosts();
+
+        this.setState({
+            containerWillMigrate: container,
+            selectContainerMigrateModal: true
         });
     }
 
@@ -209,6 +226,7 @@ class Containers extends React.Component {
         } else {
             const restartActions = [];
             const stopActions = [];
+            const kebabMenuActions = [];
 
             restartActions.push({ label: _("Restart"), onActivate: () => this.restartContainer(container) });
             restartActions.push({ label: _("Force restart"), onActivate: () => this.restartContainer(container, true) });
@@ -219,6 +237,11 @@ class Containers extends React.Component {
             if (container.isSystem)
                 stopActions.push({ label: _("Checkpoint"), onActivate: () => this.checkpointContainer(container) });
             actions.push(<DropDown key={_(container.Id) + "stop"} actions={stopActions} />);
+
+            if (container.isSystem)
+                kebabMenuActions.push({ label: _("Migrate"), onActivate: () => this.migrateContainer(container) });
+            if (kebabMenuActions.length !== 0)
+                actions.push(<DropDown isKebab actions={kebabMenuActions} />);
         }
 
         return {
@@ -285,6 +308,44 @@ class Containers extends React.Component {
                 });
     }
 
+    handleMigrateContainer(args, targetHost) {
+        const container = this.state.containerWillMigrate;
+        this.setState({ migrateInProgress: true });
+
+        const newArgs = {
+            keep: args.keep,
+            leaveRunning: args.leaveRunning,
+            tcpEstablished: args.tcpEstablished,
+            ignoreRootFS: args.ignoreRootFS,
+            ignoreStaticIP: args.ignoreStaticIP,
+            ignoreStaticMAC: args.ignoreStaticMAC
+        };
+
+        const callbacks = {
+            imageInspect: () => this.setState({ migrationStateLabel: _("Looking for image on target...") }),
+            imageExport: () => this.setState({ migrationStateLabel: _("Exporting image...") }),
+            imageImport: () => this.setState({ migrationStateLabel: _("Importing image...") }),
+            imageTagging: () => this.setState({ migrationStateLabel: _("Tagging image...") }),
+            containerInspect: () => this.setState({ migrationStateLabel: _("Looking for container on target...") }),
+            containerExport: () => this.setState({ migrationStateLabel: _("Exporting container...") }),
+            containerCreate: () => this.setState({ migrationStateLabel: _("Creating container...") }),
+            containerImport: () => this.setState({ migrationStateLabel: _("Importing container...") })
+        };
+
+        client.migrateContainer(container.isSystem, container.Id, newArgs, targetHost, callbacks)
+                .catch(ex => {
+                    const error = cockpit.format(_("Failed to migrate container $0"), container.Names);
+                    this.props.onAddNotification({ type: 'danger', error, errorDetail: ex.message ? ex.message : JSON.stringify(ex) });
+                })
+                .finally(() => {
+                    this.setState({
+                        migrateInProgress: false,
+                        migrationStateLabel: "",
+                        selectContainerMigrateModal: false
+                    });
+                });
+    }
+
     handleCheckpointContainerDeleteModal() {
         this.setState((prevState) => ({
             selectContainerCheckpointModal: !prevState.selectContainerCheckpointModal,
@@ -294,6 +355,12 @@ class Containers extends React.Component {
     handleRestoreContainerDeleteModal() {
         this.setState((prevState) => ({
             selectContainerRestoreModal: !prevState.selectContainerRestoreModal,
+        }));
+    }
+
+    handleMigrateContainerDeleteModal() {
+        this.setState((prevState) => ({
+            selectContainerMigrateModal: !prevState.selectContainerMigrateModal,
         }));
     }
 
@@ -417,6 +484,16 @@ class Containers extends React.Component {
                 containerWillCheckpoint={this.state.containerWillRestore}
                 restoreInProgress={this.state.restoreInProgress}
             />;
+        const containerMigrateModal =
+            <ContainerMigrateModal
+                selectContainerMigrateModal={this.state.selectContainerMigrateModal}
+                handleMigrateContainer={this.handleMigrateContainer}
+                handleMigrateContainerDeleteModal={this.handleMigrateContainerDeleteModal}
+                containerWillMigrate={this.state.containerWillMigrate}
+                remoteHosts={this.state.remoteHosts}
+                migrateInProgress={this.state.migrateInProgress}
+                migrationStateLabel={this.state.migrationStateLabel}
+            />;
         const containerRemoveErrorModal =
             <ContainerRemoveErrorModal
                 setContainerRemoveErrorModal={this.state.setContainerRemoveErrorModal}
@@ -504,6 +581,7 @@ class Containers extends React.Component {
                     {containerDeleteModal}
                     {containerCheckpointModal}
                     {containerRestoreModal}
+                    {containerMigrateModal}
                     {containerRemoveErrorModal}
                     {this.state.showCommitModal && containerCommitModal}
                 </>
