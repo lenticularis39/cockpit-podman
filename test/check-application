@@ -15,6 +15,7 @@ sys.path.append(os.path.join(os.path.dirname(TEST_DIR), "bots/machine"))
 
 import testlib
 from machine_core import ssh_connection
+from machine_core.constants import TEST_OS_DEFAULT
 
 REGISTRIES_CONF="""
 [registries.search]
@@ -1418,6 +1419,160 @@ class TestApplication(testlib.MachineCase):
         b = self.browser
         b.click(".pf-c-modal-box footer .%s" % key_type)
         b.wait_not_present(".pf-c-modal-box footer .%s" % key_type)
+
+
+class TestContainerMigration(testlib.MachineCase):
+    provision = {
+        "machine1": {"address": "10.111.113.1/20"},
+        "machine2": {"address": "10.111.113.2/20"},
+    }
+
+    def start_machine_troubleshoot(self, new=False, known_host=False, password=None):
+        b = self.browser
+        b.wait_visible("#machine-troubleshoot")
+        b.click('#machine-troubleshoot')
+        b.wait_popup('troubleshoot-dialog')
+        if new:
+            b.click('#troubleshoot-dialog .modal-footer button:contains(Add)')
+            if not known_host:
+                b.wait_in_text('#troubleshoot-dialog', "Fingerprint")
+                b.click('#troubleshoot-dialog .modal-footer button:contains(Connect)')
+        if password:
+            b.wait_in_text('#troubleshoot-dialog', "Unable to log in")
+            b.set_val('#login-custom-password', password)
+            b.click('#troubleshoot-dialog .modal-footer button:contains(Log in)')
+
+    def add_machine(self, address, known_host=False, password="foobar"):
+        b = self.browser
+        b.switch_to_top()
+        b.go("/@%s" % address)
+        self.start_machine_troubleshoot(new=True, known_host=known_host, password=password)
+        b.wait_popdown('troubleshoot-dialog')
+        b.enter_page("/system", host=address)
+
+    def setup_ssh_auth(self):
+        self.machine.execute("d=/home/admin/.ssh; mkdir -p $d; chown admin:admin $d; chmod 700 $d")
+        self.machine.execute("test -f /home/admin/.ssh/id_rsa || ssh-keygen -f /home/admin/.ssh/id_rsa -t rsa -N ''")
+        self.machine.execute("chown admin:admin /home/admin/.ssh/id_rsa*")
+        pubkey = self.machine.execute("cat /home/admin/.ssh/id_rsa.pub")
+
+        for m in self.machines:
+            self.machines[m].execute("d=/home/admin/.ssh; mkdir -p $d; chown admin:admin $d; chmod 700 $d")
+            self.machines[m].write("/home/admin/.ssh/authorized_keys", pubkey)
+            self.machines[m].execute("chown admin:admin /home/admin/.ssh/authorized_keys")
+
+    def setUp(self):
+        super().setUp()
+        self.machine.execute("hostnamectl set-hostname machine1")
+        self.machine2 = self.machines['machine2']
+        self.machine2.execute("hostnamectl set-hostname machine2")
+
+        # Disable preloading on all machines ("machine1" is done in testlib.py)
+        # Preloading on machines with debug build can overload the browser and cause slowness and browser crashes
+        # In these tests we actually switch between machines in quick succession which can make things even worse
+        if self.machine.image == TEST_OS_DEFAULT:
+            self.machines["machine2"].write("/usr/share/cockpit/packagekit/override.json", '{ "preload": [ ] }')
+            self.machines["machine2"].write("/usr/share/cockpit/systemd/override.json", '{ "preload": [ ] }')
+
+        self.setup_ssh_auth()
+
+        for m in self.machines:
+            self.machine = self.machines[m]
+
+            self.machine.execute("systemctl stop podman.service; systemctl --now enable podman.socket")
+
+            # backup/restore pristine podman state, so that tests can run on existing testbeds
+            self.restore_dir("/var/lib/containers", reboot_safe=True)
+
+            self.addCleanup(self.machine.execute, "systemctl stop podman.service")
+
+            # HACK: sometimes podman leaks mounts
+            self.addCleanup(self.machine.execute, "podman rm --force --all && "
+                                                  "findmnt --list -otarget | grep /var/lib/containers/. | xargs -r umount || true")
+        self.machine = self.machines["machine1"]
+
+        self.has_criu = self.machine.image not in ["debian-testing", "ubuntu-stable"]
+        self.has_selinux = self.machine.image not in ["debian-testing", "ubuntu-stable"]
+
+    def testBasic(self):
+        b = self.browser
+        m1 = self.machine
+        m2 = self.machine2
+
+        self.login_and_go(None)
+        self.add_machine("10.111.113.2", password=None)
+
+
+class TestMultiMachineAdd(testlib.MachineCase):
+    provision = {
+        "machine1": {"address": "10.111.113.1/20"},
+        "machine2": {"address": "10.111.113.2/20"},
+        "machine3": {"address": "10.111.113.3/20"},
+    }
+
+    def start_machine_troubleshoot(self, new=False, known_host=False, password=None):
+        b = self.browser
+        b.wait_visible("#machine-troubleshoot")
+        b.click('#machine-troubleshoot')
+        b.wait_popup('troubleshoot-dialog')
+        if new:
+            b.click('#troubleshoot-dialog .modal-footer button:contains(Add)')
+            if not known_host:
+                b.wait_in_text('#troubleshoot-dialog', "Fingerprint")
+                b.click('#troubleshoot-dialog .modal-footer button:contains(Connect)')
+        if password:
+            b.wait_in_text('#troubleshoot-dialog', "Unable to log in")
+            b.set_val('#login-custom-password', password)
+            b.click('#troubleshoot-dialog .modal-footer button:contains(Log in)')
+
+    def add_machine(self, address, known_host=False, password="foobar"):
+        b = self.browser
+        b.switch_to_top()
+        b.go("/@%s" % address)
+        self.start_machine_troubleshoot(new=True, known_host=known_host, password=password)
+        b.wait_popdown('troubleshoot-dialog')
+        b.enter_page("/system", host=address)
+
+
+    def setup_ssh_auth(self):
+        self.machine.execute("d=/home/admin/.ssh; mkdir -p $d; chown admin:admin $d; chmod 700 $d")
+        self.machine.execute("test -f /home/admin/.ssh/id_rsa || ssh-keygen -f /home/admin/.ssh/id_rsa -t rsa -N ''")
+        self.machine.execute("chown admin:admin /home/admin/.ssh/id_rsa*")
+        pubkey = self.machine.execute("cat /home/admin/.ssh/id_rsa.pub")
+
+        for m in self.machines:
+            self.machines[m].execute("d=/home/admin/.ssh; mkdir -p $d; chown admin:admin $d; chmod 700 $d")
+            self.machines[m].write("/home/admin/.ssh/authorized_keys", pubkey)
+            self.machines[m].execute("chown admin:admin /home/admin/.ssh/authorized_keys")
+
+    def setUp(self):
+        super().setUp()
+        self.machine2 = self.machines['machine2']
+        self.machine2.execute("hostnamectl set-hostname machine2")
+        self.machine3 = self.machines['machine3']
+        self.machine3.execute("hostnamectl set-hostname machine3")
+
+        # Disable preloading on all machines ("machine1" is done in testlib.py)
+        # Preloading on machines with debug build can overload the browser and cause slowness and browser crashes
+        # In these tests we actually switch between machines in quick succession which can make things even worse
+        if self.machine.image == TEST_OS_DEFAULT:
+            self.machines["machine2"].write("/usr/share/cockpit/packagekit/override.json", '{ "preload": [ ] }')
+            self.machines["machine2"].write("/usr/share/cockpit/systemd/override.json", '{ "preload": [ ] }')
+            self.machines["machine3"].write("/usr/share/cockpit/packagekit/override.json", '{ "preload": [ ] }')
+            self.machines["machine3"].write("/usr/share/cockpit/systemd/override.json", '{ "preload": [ ] }')
+
+        self.setup_ssh_auth()
+
+    def testBasic(self):
+        b = self.browser
+        m2 = self.machine2
+        m3 = self.machine3
+
+
+        self.login_and_go(None)
+        self.add_machine("10.111.113.2", password=None)
+        self.add_machine("10.111.113.3", password=None)
+
 
 if __name__ == '__main__':
     testlib.test_main()
